@@ -145,10 +145,12 @@ def job_prep_start(req: JobPrepStartRequest, user_id: str = Depends(get_current_
 
 
 @router.post("/interview/start")
-async def start_interview(req: StartInterviewRequest, user_id: str = Depends(get_current_user)):
+async def start_interview(
+    req: StartInterviewRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
     """Start a new interview session."""
-    session_id = str(uuid.uuid4())[:8]
-
     if req.mode == InterviewMode.TOPIC_DRILL:
         topics = load_topics(user_id)
         if not req.topic or req.topic not in topics:
@@ -157,32 +159,29 @@ async def start_interview(req: StartInterviewRequest, user_id: str = Depends(get
         user_prefs = load_user_settings(user_id)
         num_questions = req.num_questions or user_prefs.num_questions
         divergence = req.divergence or user_prefs.divergence
-
-        try:
-            # generate_drill_questions is sync + LLM-bound; offload to thread
-            # to avoid blocking the event loop.
-            questions = await asyncio.to_thread(
-                generate_drill_questions,
-                req.topic,
-                user_id,
-                num_questions=num_questions,
-                divergence=divergence,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(500, str(exc))
-
-        create_session(session_id, req.mode.value, req.topic, questions=questions, user_id=user_id)
-        _drill_sessions[session_id] = {"topic": req.topic, "questions": questions, "user_id": user_id}
+        session_id = str(uuid.uuid4())[:8]
+        task_id = f"topic_drill_{session_id}"
+        _task_status[task_id] = {"status": "pending", "type": "topic_drill_start"}
+        background_tasks.add_task(
+            _start_drill_background,
+            task_id,
+            session_id,
+            req.topic,
+            user_id,
+            num_questions,
+            divergence,
+        )
         return {
-            "session_id": session_id,
+            "task_id": task_id,
             "mode": req.mode.value,
             "topic": req.topic,
-            "questions": questions,
+            "status": "pending",
         }
 
     if req.mode == InterviewMode.RESUME:
         from backend.graphs.resume_interview import compile_resume_interview
 
+        session_id = str(uuid.uuid4())[:8]
         target_role = (req.target_role or "").strip()
         if not target_role:
             target_role = (get_profile(user_id).get("target_role") or "").strip()
@@ -459,6 +458,45 @@ def _end_jd_prep_background(session_id, questions, answers, preview, meta, user_
             user_id=user_id, review_error=str(exc)[:500] or "未知错误",
         )
         _task_status[session_id] = {"status": "error", "type": "jd_review"}
+
+
+def _start_drill_background(
+    task_id: str,
+    session_id: str,
+    topic: str,
+    user_id: str,
+    num_questions: int,
+    divergence: int,
+):
+    """Background task: generate topic drill questions and create the session."""
+    try:
+        questions = generate_drill_questions(
+            topic,
+            user_id,
+            num_questions=num_questions,
+            divergence=divergence,
+        )
+
+        create_session(session_id, InterviewMode.TOPIC_DRILL.value, topic, questions=questions, user_id=user_id)
+        _drill_sessions[session_id] = {"topic": topic, "questions": questions, "user_id": user_id}
+        _task_status[task_id] = {
+            "status": "done",
+            "type": "topic_drill_start",
+            "result": {
+                "session_id": session_id,
+                "mode": InterviewMode.TOPIC_DRILL.value,
+                "topic": topic,
+                "questions": questions,
+            },
+        }
+        logger.info("Drill session generated for topic %s", topic)
+    except Exception as exc:
+        logger.exception("Drill session generation failed for topic %s", topic)
+        _task_status[task_id] = {
+            "status": "error",
+            "type": "topic_drill_start",
+            "error": str(exc)[:500] or "未知错误",
+        }
 
 
 def _extract_answers_from_transcript(transcript: list, questions: list) -> list[dict]:

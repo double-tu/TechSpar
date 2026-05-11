@@ -13,7 +13,7 @@ export default function TopicDrill() {
   const [topics, setTopics] = useState({});
   const [selectedTopic, setSelectedTopic] = useState(null);
   const [pageLoading, setPageLoading] = useState(true);
-  const { creatingSessionMode, setCreatingSessionMode } = useTaskStatus();
+  const { creatingSessionMode, setCreatingSessionMode, startTask } = useTaskStatus();
   const loading = creatingSessionMode === "topic_drill";
 
   useEffect(() => {
@@ -25,14 +25,32 @@ export default function TopicDrill() {
 
   const handleStart = async () => {
     if (!selectedTopic) return;
+    const topicName = topics[selectedTopic]?.name || selectedTopic;
+    let waitingForTask = false;
     setCreatingSessionMode("topic_drill");
     try {
       const data = await startInterview("topic_drill", selectedTopic);
+      if (data.status === "pending" && data.task_id) {
+        waitingForTask = true;
+        startTask(data.task_id, "topic_drill_start", `${topicName} 题目生成中`, {
+          onDone: (result) => {
+            setCreatingSessionMode(null);
+            navigate(`/interview/${result.session_id}`, { state: result });
+          },
+          onError: (message) => {
+            setCreatingSessionMode(null);
+            alert("启动失败: " + (message || "题目生成失败"));
+          },
+        });
+        return;
+      }
       navigate(`/interview/${data.session_id}`, { state: data });
     } catch (err) {
       alert("启动失败: " + err.message);
     } finally {
-      setCreatingSessionMode(null);
+      if (!waitingForTask) {
+        setCreatingSessionMode(null);
+      }
     }
   };
 

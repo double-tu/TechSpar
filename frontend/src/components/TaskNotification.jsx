@@ -3,6 +3,9 @@ import { X, Loader2, FileText, AlertCircle } from "lucide-react";
 import { useTaskStatus } from "../contexts/TaskStatusContext";
 
 function getNavTarget(task) {
+  if (task.type === "topic_drill_start" && task.result?.session_id) {
+    return `/interview/${task.result.session_id}`;
+  }
   if (task.type === "retrospective" && task.result?.topic) {
     return `/profile/topic/${task.result.topic}`;
   }
@@ -48,7 +51,7 @@ export default function TaskNotification() {
           {task.status === "error" && (
             <>
               <AlertCircle size={18} className="text-destructive shrink-0" />
-              <span className="text-[14px] text-destructive">{task.label}失败</span>
+              <span className="text-[14px] text-destructive">{task.error || `${task.label}失败`}</span>
             </>
           )}
 

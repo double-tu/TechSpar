@@ -136,7 +136,7 @@ class Settings(BaseSettings):
             return str(model_path)
         return self.local_embedding_model_name()
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()
