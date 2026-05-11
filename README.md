@@ -253,6 +253,15 @@ ALIYUN_OSS_ENDPOINT=oss-cn-shanghai.aliyuncs.com
 
 ### 2. Docker 启动
 
+如果服务器上的 `80` / `8000` 已被占用，可以先在 `.env` 里调整宿主机映射端口，例如：
+
+```env
+FRONTEND_PORT=8080
+BACKEND_PORT=18000
+```
+
+其中前端会对外暴露 `8080`，后端只绑定到服务器本机 `127.0.0.1:18000` 供调试使用。
+
 ```bash
 docker compose up --build
 ```
@@ -260,7 +269,7 @@ docker compose up --build
 启动后访问：
 
 ```text
-http://localhost
+http://localhost:8080
 ```
 
 ### 3. 手动启动

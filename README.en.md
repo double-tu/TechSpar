@@ -172,11 +172,20 @@ LOCAL_EMBEDDING_PATH=
 
 ### 2a. Docker (Recommended)
 
+If ports `80` and `8000` are already occupied on your server, set host-side ports in `.env` first:
+
+```env
+FRONTEND_PORT=8080
+BACKEND_PORT=18000
+```
+
+The frontend is exposed on `8080`, while the backend is bound to `127.0.0.1:18000` for local debugging only.
+
 ```bash
 docker compose up --build
 ```
 
-Visit `http://localhost` to start. API requests are automatically proxied via Nginx.
+Visit `http://localhost:8080` to start. API requests are automatically proxied via Nginx.
 
 ### 2b. Manual Setup
 

@@ -116,6 +116,20 @@ http://localhost:5173
 
 ### 5. Docker 启动
 
+如果服务器上的 `80` 和 `8000` 已经被占用，先在 `.env` 里改宿主机端口。推荐这样配：
+
+```env
+FRONTEND_PORT=8080
+BACKEND_PORT=18000
+```
+
+说明：
+
+* 前端会映射成 `宿主机 FRONTEND_PORT -> 容器 80`，浏览器访问 `http://服务器IP:8080`。
+* 后端会映射成 `127.0.0.1:BACKEND_PORT -> 容器 8000`，只给服务器本机调试使用，不直接对公网暴露。
+* 前端容器内部会继续通过 `http://backend:8000` 访问后端，所以**不需要**改前端代码或 Nginx 反向代理配置。
+* 如果你的服务器前面已经有 Nginx / Caddy 占着 `80` / `443`，这种做法最合适：让现有网关反代到 `127.0.0.1:8080`。
+
 ```bash
 docker compose up --build
 ```
@@ -123,7 +137,7 @@ docker compose up --build
 启动后访问：
 
 ```text
-http://localhost
+http://localhost:8080
 ```
 
 ### 6. 面试 Copilot 的额外配置
@@ -195,6 +209,6 @@ ALIYUN_OSS_ENDPOINT=oss-cn-shanghai.aliyuncs.com
 ### 8. 线上部署注意事项
 
 * 手动开发模式下，前端默认是 `5173`，后端是 `8000`。
-* Docker 模式下，前端默认对外暴露 `80` 端口。
+* Docker 模式下，前端默认对外暴露 `8080`，后端默认只绑定到本机 `127.0.0.1:18000`。
 * 如果你在线上要使用麦克风或录音相关能力，建议启用 HTTPS；浏览器对非 `localhost` 的音频权限更严格。
 * 线上环境不要保留默认的 `JWT_SECRET`、`DEFAULT_PASSWORD`。
