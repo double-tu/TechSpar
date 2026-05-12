@@ -5,6 +5,7 @@ import {
   getTopics, getCoreKnowledge, updateCoreKnowledge, createCoreKnowledge,
   deleteCoreKnowledge, getHighFreq, updateHighFreq, createTopic, deleteTopic, generateKnowledge,
 } from "../api/interview";
+import { useTaskStatus } from "../contexts/TaskStatusContext";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +14,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 
 export default function Knowledge() {
+  const { startTask, dismissTask } = useTaskStatus();
   const [topics, setTopics] = useState({});
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState("core");
@@ -115,7 +117,23 @@ export default function Knowledge() {
   const handleGenerate = async () => {
     setGenerating(true);
     try {
-      await generateKnowledge(selected);
+      const data = await generateKnowledge(selected);
+      if (data.status === "pending" && data.task_id) {
+        startTask(data.task_id, "knowledge_generate", `${topics[selected]?.name || selected} 知识库生成中`, {
+          onDone: async (result) => {
+            dismissTask(data.task_id);
+            await loadCore(result?.topic || selected);
+            setExpandedFile("README.md");
+            setGenerating(false);
+          },
+          onError: (message) => {
+            dismissTask(data.task_id);
+            alert("生成失败: " + (message || "知识库生成失败"));
+            setGenerating(false);
+          },
+        });
+        return;
+      }
       await loadCore(selected);
       setExpandedFile("README.md");
     } catch (e) { alert("生成失败: " + e.message); }

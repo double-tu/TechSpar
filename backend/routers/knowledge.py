@@ -1,6 +1,8 @@
 """Knowledge and graph routes."""
 
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.auth import get_current_user
@@ -8,8 +10,10 @@ from backend.config import settings
 from backend.graph import build_graph
 from backend.indexer import _index_cache, load_topics
 from backend.llm_provider import get_langchain_llm
+from backend.runtime import _task_status
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger("uvicorn")
 
 
 @router.get("/knowledge/{topic}/core")
@@ -92,37 +96,75 @@ async def create_core_knowledge(topic: str, body: dict, user_id: str = Depends(g
     return {"ok": True, "filename": filename}
 
 
+def _generate_core_knowledge_background(task_id: str, topic: str, topic_name: str, topic_dir: str, user_id: str):
+    """Background task: generate foundational knowledge for a topic."""
+    try:
+        llm = get_langchain_llm()
+        response = llm.invoke([
+            SystemMessage(content="你是一位资深技术面试官，擅长梳理技术领域的核心知识体系。"),
+            HumanMessage(content=(
+                f"请为「{topic_name}」这个技术领域生成一份核心知识梳理，作为面试出题和评分的参考依据。\n\n"
+                "要求：\n"
+                "- 用 Markdown 格式\n"
+                f"- 以 `# {topic_name}` 作为标题\n"
+                "- 列出该领域最核心的 8-12 个知识点，每个用二级标题\n"
+                "- 每个知识点下用简洁的要点说明关键概念、原理、常见面试考点\n"
+                "- 重点覆盖：核心概念、工作原理、最佳实践、常见陷阱\n"
+                "- 保持简洁实用，面向面试准备场景\n"
+                "- 直接输出 Markdown 内容，不要包裹在代码块中"
+            )),
+        ])
+        content = response.content.strip()
+
+        readme = settings.user_knowledge_path(user_id) / topic_dir / "README.md"
+        readme.parent.mkdir(parents=True, exist_ok=True)
+        readme.write_text(content, encoding="utf-8")
+        _index_cache.pop((user_id, topic), None)
+        _task_status[task_id] = {
+            "status": "done",
+            "type": "knowledge_generate",
+            "result": {
+                "topic": topic,
+                "topic_name": topic_name,
+                "content": content,
+            },
+        }
+    except Exception as exc:
+        logger.exception("Knowledge generation failed for topic %s", topic)
+        _task_status[task_id] = {
+            "status": "error",
+            "type": "knowledge_generate",
+            "error": str(exc)[:500] or "未知错误",
+        }
+
+
 @router.post("/knowledge/{topic}/generate")
-async def generate_core_knowledge(topic: str, user_id: str = Depends(get_current_user)):
+async def generate_core_knowledge(
+    topic: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
     """Use LLM to generate foundational knowledge content for a topic."""
     topics = load_topics(user_id)
     if topic not in topics:
         raise HTTPException(400, f"Unknown topic: {topic}")
 
     topic_name = topics[topic].get("name", topic)
-    llm = get_langchain_llm()
-    response = llm.invoke([
-        SystemMessage(content="你是一位资深技术面试官，擅长梳理技术领域的核心知识体系。"),
-        HumanMessage(content=(
-            f"请为「{topic_name}」这个技术领域生成一份核心知识梳理，作为面试出题和评分的参考依据。\n\n"
-            "要求：\n"
-            "- 用 Markdown 格式\n"
-            f"- 以 `# {topic_name}` 作为标题\n"
-            "- 列出该领域最核心的 8-12 个知识点，每个用二级标题\n"
-            "- 每个知识点下用简洁的要点说明关键概念、原理、常见面试考点\n"
-            "- 重点覆盖：核心概念、工作原理、最佳实践、常见陷阱\n"
-            "- 保持简洁实用，面向面试准备场景\n"
-            "- 直接输出 Markdown 内容，不要包裹在代码块中"
-        )),
-    ])
-    content = response.content.strip()
+    task_id = f"knowledge_generate_{topic}_{user_id[:8]}"
+    existing = _task_status.get(task_id)
+    if existing and existing.get("status") == "pending":
+        return {"task_id": task_id, "status": "pending"}
 
-    topic_dir = settings.user_knowledge_path(user_id) / topics[topic]["dir"]
-    topic_dir.mkdir(parents=True, exist_ok=True)
-    readme = topic_dir / "README.md"
-    readme.write_text(content, encoding="utf-8")
-    _index_cache.pop((user_id, topic), None)
-    return {"ok": True, "content": content}
+    _task_status[task_id] = {"status": "pending", "type": "knowledge_generate"}
+    background_tasks.add_task(
+        _generate_core_knowledge_background,
+        task_id,
+        topic,
+        topic_name,
+        topics[topic]["dir"],
+        user_id,
+    )
+    return {"task_id": task_id, "status": "pending"}
 
 
 @router.get("/knowledge/{topic}/high_freq")

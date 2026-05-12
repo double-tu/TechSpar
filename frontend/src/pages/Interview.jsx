@@ -12,6 +12,40 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 
+function resolveBatchQuestions(questions = [], transcript = []) {
+  if (Array.isArray(questions) && questions.length > 0) return questions;
+
+  const recovered = [];
+  const seen = new Set();
+  for (const entry of transcript || []) {
+    if (entry?.role !== "assistant") continue;
+    const text = (entry?.content || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    recovered.push({ id: recovered.length + 1, question: text });
+  }
+  return recovered;
+}
+
+function restoreBatchAnswers(questions = [], transcript = []) {
+  const saved = {};
+  for (let idx = 0; idx < (transcript || []).length; idx += 1) {
+    const entry = transcript[idx];
+    if (entry?.role !== "user") continue;
+    const prev = transcript[idx - 1];
+    if (!prev || prev.role !== "assistant") continue;
+    const question = questions.find((item) => item.question === prev.content);
+    if (question) saved[question.id] = entry.content;
+  }
+  return saved;
+}
+
+function findNextBatchIndex(questions = [], savedAnswers = {}) {
+  const nextIndex = questions.findIndex((question) => !savedAnswers[question.id]);
+  if (nextIndex >= 0) return nextIndex;
+  return questions.length > 0 ? questions.length - 1 : 0;
+}
+
 export default function Interview() {
   const { sessionId } = useParams();
   const location = useLocation();
@@ -35,7 +69,7 @@ export default function Interview() {
   const [sending, setSending] = useState(false);
   const [finished, setFinished] = useState(false);
   const [reviewing, setReviewing] = useState(false);
-  const [progress] = useState(location.state?.progress || "");
+  const [progress, setProgress] = useState(location.state?.progress || "");
 
   const [questions, setQuestions] = useState(location.state?.questions || []);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -43,6 +77,7 @@ export default function Interview() {
   const [drillInput, setDrillInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const activeSessionId = initData?.session_id || location.state?.session_id || sessionId || "";
 
   const drillVoice = useVoiceInput({
     onResult: useCallback((text) => setDrillInput((prev) => prev + text), []),
@@ -52,10 +87,44 @@ export default function Interview() {
   });
 
   useEffect(() => {
+    const routeState = location.state || null;
+    const routeMode = routeState?.mode;
+    const routeIsBatchMode = routeMode === "topic_drill" || routeMode === "jd_prep";
+
+    setBootstrapError("");
+    setInitData(routeState);
+    setSessionStatus(routeState?.status || null);
+    setResumeError(routeState?.review_error || "");
+    setProgress(routeState?.progress || "");
+    setMessages([]);
+    setInput("");
+    setSending(false);
+    setFinished(false);
+    setReviewing(false);
+    setQuestions(routeState?.questions || []);
+    setCurrentIndex(0);
+    setAnswers({});
+    setDrillInput("");
+    setSubmitting(false);
+    setSubmitted(false);
+
     // Fresh start from a landing page → location.state carries everything.
-    if (location.state) {
-      if (!isBatchMode && location.state.message) {
-        setMessages([{ role: "assistant", content: location.state.message }]);
+    if (routeState) {
+      if (!routeIsBatchMode && routeState.message) {
+        setMessages([{ role: "assistant", content: routeState.message }]);
+      }
+      if (routeIsBatchMode) {
+        const resolvedQuestions = resolveBatchQuestions(routeState.questions || [], routeState.transcript || []);
+        const savedAnswers = restoreBatchAnswers(resolvedQuestions, routeState.transcript || []);
+        const nextIndex = findNextBatchIndex(resolvedQuestions, savedAnswers);
+        setQuestions(resolvedQuestions);
+        setAnswers(savedAnswers);
+        setCurrentIndex(nextIndex);
+        setDrillInput(savedAnswers[resolvedQuestions[nextIndex]?.id] || "");
+        if (routeState.status && routeState.status !== "ongoing") {
+          setFinished(true);
+          setSubmitted(true);
+        }
       }
       return;
     }
@@ -63,18 +132,23 @@ export default function Interview() {
     let cancelled = false;
     (async () => {
       try {
+        if (!sessionId) {
+          throw new Error("会话 ID 缺失，无法加载训练");
+        }
         const data = await getResumableSession(sessionId);
         if (cancelled) return;
+        const resolvedQuestions = resolveBatchQuestions(data.questions || [], data.transcript || []);
         setInitData({
+          session_id: data.session_id,
           mode: data.mode,
           topic: data.topic,
           target_role: data.target_role,
-          questions: data.questions,
+          questions: resolvedQuestions,
           meta: data.meta,
           company: data.meta?.company,
           position: data.meta?.position,
         });
-        setQuestions(data.questions || []);
+        setQuestions(resolvedQuestions);
         setSessionStatus(data.status);
         setResumeError(data.review_error || "");
         if (data.mode === "resume") {
@@ -86,15 +160,11 @@ export default function Interview() {
           }
         } else {
           // Batch modes: replay saved answers so user can review which ones were skipped.
-          const saved = {};
-          (data.transcript || []).forEach((entry, idx, arr) => {
-            if (entry.role !== "user") return;
-            const prev = arr[idx - 1];
-            if (!prev || prev.role !== "assistant") return;
-            const q = (data.questions || []).find((q) => q.question === prev.content);
-            if (q) saved[q.id] = entry.content;
-          });
-          setAnswers(saved);
+          const savedAnswers = restoreBatchAnswers(resolvedQuestions, data.transcript || []);
+          const nextIndex = findNextBatchIndex(resolvedQuestions, savedAnswers);
+          setAnswers(savedAnswers);
+          setCurrentIndex(nextIndex);
+          setDrillInput(savedAnswers[resolvedQuestions[nextIndex]?.id] || "");
           if (data.status !== "ongoing") {
             setFinished(true);
             setSubmitted(true);
@@ -105,14 +175,14 @@ export default function Interview() {
         if (data.status === "reviewing") {
           const type = data.mode === "resume" ? "resume_review"
             : data.mode === "jd_prep" ? "jd_review" : "drill_review";
-          startTask(sessionId, type, "复盘生成中");
+          startTask(data.session_id || sessionId, type, "复盘生成中");
         }
       } catch (err) {
         if (!cancelled) setBootstrapError(err.message || "无法加载面试");
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [sessionId, location.key, startTask]);
 
   useEffect(() => {
     if (!isBatchMode) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -150,8 +220,12 @@ export default function Interview() {
 
   const handleEndBatch = async () => {
     if (submitting) return;
+    if (!activeSessionId) {
+      alert("当前会话 ID 丢失，请返回历史记录重新进入。");
+      return;
+    }
     // Allow retry when the previous background evaluation errored.
-    const priorTask = tasks.find((t) => t.id === sessionId);
+    const priorTask = tasks.find((t) => t.id === activeSessionId);
     const isRetry = submitted && priorTask?.status === "error";
     if (submitted && !isRetry) return;
     setSubmitting(true);
@@ -160,12 +234,12 @@ export default function Interview() {
         question_id: q.id,
         answer: answers[q.id] || "",
       }));
-      await endInterview(sessionId, answerList);
+      await endInterview(activeSessionId, answerList);
       setSubmitted(true);
       setFinished(true);
       const label = isJobPrep ? "JD 备面复盘生成中" : "专项训练复盘生成中";
       const type = isJobPrep ? "jd_review" : "drill_review";
-      startTask(sessionId, type, label);
+      startTask(activeSessionId, type, label);
     } catch (err) {
       alert("提交失败: " + err.message);
     } finally {
@@ -175,7 +249,7 @@ export default function Interview() {
 
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || sending || !activeSessionId) return;
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     setSending(true);
@@ -184,7 +258,7 @@ export default function Interview() {
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
-      await sendMessageStream(sessionId, text, {
+      await sendMessageStream(activeSessionId, text, {
         onToken: (token) => {
           setMessages((prev) => {
             const updated = [...prev];
@@ -207,7 +281,7 @@ export default function Interview() {
     } catch {
       // SSE failed — fallback to non-streaming
       try {
-        const data = await sendMessage(sessionId, text);
+        const data = await sendMessage(activeSessionId, text);
         setMessages((prev) => {
           const updated = [...prev];
           updated[updated.length - 1] = { role: "assistant", content: data.message };
@@ -228,13 +302,17 @@ export default function Interview() {
   };
 
   const handleEndResume = async () => {
+    if (!activeSessionId) {
+      alert("当前会话 ID 丢失，请返回历史记录重新进入。");
+      return;
+    }
     setReviewing(true);
     try {
-      await endInterview(sessionId);
+      await endInterview(activeSessionId);
       setFinished(true);
       setSessionStatus("reviewing");
       setResumeError("");
-      startTask(sessionId, "resume_review", "简历面试复盘生成中");
+      startTask(activeSessionId, "resume_review", "简历面试复盘生成中");
     } catch (err) {
       alert("结束面试失败: " + err.message);
     } finally {
@@ -243,12 +321,16 @@ export default function Interview() {
   };
 
   const handleRetryResumeReview = async () => {
+    if (!activeSessionId) {
+      alert("当前会话 ID 丢失，请返回历史记录重新进入。");
+      return;
+    }
     setReviewing(true);
     try {
-      await retryReview(sessionId);
+      await retryReview(activeSessionId);
       setSessionStatus("reviewing");
       setResumeError("");
-      startTask(sessionId, "resume_review", "简历面试复盘生成中");
+      startTask(activeSessionId, "resume_review", "简历面试复盘生成中");
     } catch (err) {
       alert("重新生成失败: " + err.message);
     } finally {
@@ -326,7 +408,7 @@ export default function Interview() {
             <span className="text-[13px] text-dim">{answeredCount}/{totalQ} 已答</span>
           </div>
           {(() => {
-            const task = tasks.find((t) => t.id === sessionId);
+            const task = tasks.find((t) => t.id === activeSessionId);
             const headerTaskError = task?.status === "error";
             const headerDisabled = submitting || (submitted && !headerTaskError);
             return (
@@ -350,6 +432,20 @@ export default function Interview() {
                 {isJobPrep ? "AI 会结合 JD 判断你的真实匹配度" : `AI 将对 ${totalQ} 道题逐一点评`}
               </span>
             </div>
+          ) : totalQ === 0 ? (
+            <div className="w-full max-w-[720px]">
+              <Card>
+                <CardContent className="p-6 md:p-8 text-center">
+                  <div className="text-xl font-semibold mb-3">未能恢复这场训练</div>
+                  <div className="text-[15px] text-dim leading-relaxed">
+                    这条历史记录缺少可继续训练的题目数据。请返回历史记录重新进入，或重新发起一场新的专项训练。
+                  </div>
+                  <Button variant="outline" className="mt-5" onClick={() => navigate("/history")}>
+                    返回历史记录
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
           ) : finished ? (
             <div className="w-full max-w-[720px]">
               <Card className="mb-5">
@@ -359,7 +455,7 @@ export default function Interview() {
                     共 {totalQ} 题，已回答 {answeredCount} 题，跳过 {totalQ - answeredCount} 题
                   </div>
                   {(() => {
-                    const task = tasks.find((t) => t.id === sessionId);
+                    const task = tasks.find((t) => t.id === activeSessionId);
                     const taskDone = task?.status === "done";
                     const taskError = task?.status === "error";
                     const canRetry = submitted && taskError;
@@ -371,7 +467,7 @@ export default function Interview() {
                           className="px-10"
                           onClick={
                             submitted && taskDone
-                              ? () => navigate(`/review/${sessionId}`)
+                              ? () => navigate(`/review/${activeSessionId}`)
                               : !submitted || canRetry
                               ? handleEndBatch
                               : undefined
@@ -508,14 +604,14 @@ export default function Interview() {
           )}
         </div>
         {(() => {
-          const task = tasks.find((t) => t.id === sessionId);
+          const task = tasks.find((t) => t.id === activeSessionId);
           const taskDone = task?.status === "done" || sessionStatus === "reviewed";
           const taskError = task?.status === "error" || sessionStatus === "review_failed";
           // Four branches: live chat → end, review failed → retry, review in-flight → wait, review done → view.
           let handler;
           let label;
           if (taskDone) {
-            handler = () => navigate(`/review/${sessionId}`);
+            handler = () => navigate(`/review/${activeSessionId}`);
             label = "查看复盘";
           } else if (taskError) {
             handler = handleRetryResumeReview;

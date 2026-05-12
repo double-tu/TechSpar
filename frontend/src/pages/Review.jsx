@@ -186,19 +186,43 @@ function DrillReview({ scores, overall, questions, answers, topic, sessionId, in
   for (const a of (answers || [])) answerMap[a.question_id] = a.answer;
   const scoreMap = {};
   for (const s of (scores || [])) scoreMap[s.question_id] = s;
+  const { startTask, dismissTask } = useTaskStatus();
   const [refAnswers, setRefAnswers] = useState(initialRefAnswers || {});
   const [refLoading, setRefLoading] = useState({});
 
   const handleRefAnswer = async (qId) => {
     if (refAnswers[qId]) return;
     setRefLoading((p) => ({ ...p, [qId]: true }));
+    let waitingForTask = false;
     try {
       const data = await getReferenceAnswer(sessionId, qId);
-      setRefAnswers((p) => ({ ...p, [qId]: data.reference_answer }));
+      if (data.reference_answer) {
+        setRefAnswers((p) => ({ ...p, [qId]: data.reference_answer }));
+        return;
+      }
+      if (data.status === "pending" && data.task_id) {
+        waitingForTask = true;
+        startTask(data.task_id, "reference_answer", `Q${qId} 参考答案生成中`, {
+          onDone: (result) => {
+            setRefAnswers((p) => ({ ...p, [qId]: result.reference_answer || "" }));
+            setRefLoading((p) => ({ ...p, [qId]: false }));
+            dismissTask(data.task_id);
+          },
+          onError: (message) => {
+            setRefAnswers((p) => ({ ...p, [qId]: "生成失败: " + (message || "参考答案生成失败") }));
+            setRefLoading((p) => ({ ...p, [qId]: false }));
+            dismissTask(data.task_id);
+          },
+        });
+        return;
+      }
     } catch (e) {
       setRefAnswers((p) => ({ ...p, [qId]: "生成失败: " + e.message }));
+    } finally {
+      if (!waitingForTask) {
+        setRefLoading((p) => ({ ...p, [qId]: false }));
+      }
     }
-    setRefLoading((p) => ({ ...p, [qId]: false }));
   };
 
   const avgScore = overall?.avg_score || "-";
@@ -497,83 +521,184 @@ function inferAnswers(questions, transcript) {
   });
 }
 
+function hydrateReviewState(data = {}) {
+  const questions = data.questions || [];
+  const transcript = data.messages || data.transcript || [];
+  const mode = data.mode || null;
+  const answers = data.answers
+    || ((mode === "topic_drill" || mode === "jd_prep") ? inferAnswers(questions, transcript) : []);
+
+  return {
+    review: data.review || null,
+    scores: data.scores || null,
+    overall: data.overall || null,
+    questions,
+    answers,
+    messages: transcript,
+    mode,
+    topic: data.topic || null,
+    topicsCovered: data.topics_covered || data.overall?.topics_covered || [],
+    meta: data.meta || {},
+    referenceAnswers: data.reference_answers || {},
+  };
+}
+
 export default function Review() {
   const { sessionId } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
 
   const stateData = location.state || {};
+  const hydratedState = hydrateReviewState(stateData);
 
-  const [review, setReview] = useState(stateData.review || null);
-  const [scores, setScores] = useState(stateData.scores || null);
-  const [overall, setOverall] = useState(stateData.overall || null);
-  const [questions, setQuestions] = useState(stateData.questions || []);
-  const [answers, setAnswers] = useState(stateData.answers || []);
-  const [messages, setMessages] = useState(stateData.messages || []);
-  const [mode, setMode] = useState(stateData.mode || null);
-  const [topic, setTopic] = useState(stateData.topic || null);
-  const [topicsCovered, setTopicsCovered] = useState(stateData.topics_covered || []);
-  const [meta, setMeta] = useState(stateData.meta || {});
-  const [referenceAnswers, setReferenceAnswers] = useState(stateData.reference_answers || {});
+  const [review, setReview] = useState(hydratedState.review);
+  const [scores, setScores] = useState(hydratedState.scores);
+  const [overall, setOverall] = useState(hydratedState.overall);
+  const [questions, setQuestions] = useState(hydratedState.questions);
+  const [answers, setAnswers] = useState(hydratedState.answers);
+  const [messages, setMessages] = useState(hydratedState.messages);
+  const [mode, setMode] = useState(hydratedState.mode);
+  const [topic, setTopic] = useState(hydratedState.topic);
+  const [topicsCovered, setTopicsCovered] = useState(hydratedState.topicsCovered);
+  const [meta, setMeta] = useState(hydratedState.meta);
+  const [referenceAnswers, setReferenceAnswers] = useState(hydratedState.referenceAnswers);
   const [showTranscript, setShowTranscript] = useState(false);
-  const [loading, setLoading] = useState(!review && !scores);
+  const [loading, setLoading] = useState(!(hydratedState.review || hydratedState.scores));
   const [restarting, setRestarting] = useState(false);
-  const { setCreatingSessionMode } = useTaskStatus();
+  const { startTask, dismissTask } = useTaskStatus();
 
   const handleRestart = async () => {
     const currentMode = mode || stateData.mode;
     if (!currentMode || currentMode === "recording") return;
     setRestarting(true);
+    let waitingForTask = false;
     try {
       let data;
       if (currentMode === "jd_prep") {
         const m = meta || stateData.meta || {};
         data = await startJobPrep({
-          jd_text: m.jd_text,
+          jd_text: m.jd_text || m.jd_excerpt || "",
           company: m.company,
           position: m.position,
           use_resume: m.use_resume,
         });
+        if (data.status === "pending" && data.task_id) {
+          waitingForTask = true;
+          startTask(data.task_id, "job_prep_start", "JD 备面生成中", {
+            onDone: (result) => {
+              setRestarting(false);
+              dismissTask(data.task_id);
+              navigate(`/interview/${result.session_id}`, {
+                state: { ...result, mode: currentMode, topic: topic || stateData.topic, meta: meta || stateData.meta },
+              });
+            },
+            onError: (message) => {
+              setRestarting(false);
+              dismissTask(data.task_id);
+              alert("启动失败: " + (message || "JD 备面生成失败"));
+            },
+          });
+          return;
+        }
+      } else if (currentMode === "topic_drill") {
+        data = await startInterview(currentMode, topic || stateData.topic);
+        if (data.status === "pending" && data.task_id) {
+          waitingForTask = true;
+          startTask(data.task_id, "topic_drill_start", "专项训练生成中", {
+            onDone: (result) => {
+              setRestarting(false);
+              dismissTask(data.task_id);
+              navigate(`/interview/${result.session_id}`, {
+                state: {
+                  ...result,
+                  mode: currentMode,
+                  topic: topic || stateData.topic,
+                },
+              });
+            },
+            onError: (message) => {
+              setRestarting(false);
+              dismissTask(data.task_id);
+              alert("启动失败: " + (message || "专项训练生成失败"));
+            },
+          });
+          return;
+        }
       } else {
         data = await startInterview(currentMode, topic || stateData.topic);
       }
-      navigate(`/interview/${data.session_id}`, { state: { ...data, mode: currentMode, topic: topic || stateData.topic, meta: meta || stateData.meta } });
+      navigate(`/interview/${data.session_id}`, {
+        state: {
+          ...data,
+          mode: currentMode,
+          topic: topic || stateData.topic,
+          meta: meta || stateData.meta,
+        },
+      });
     } catch (err) {
       alert("启动失败: " + err.message);
     } finally {
-      setRestarting(false);
+      if (!waitingForTask) {
+        setRestarting(false);
+      }
     }
   };
 
   useEffect(() => {
-    if (!review && !scores) {
-      setLoading(true);
-      getReview(sessionId)
-        .then((data) => {
-          setReview(data.review);
-          if (data.scores) setScores(data.scores);
-          if (data.questions) setQuestions(data.questions);
-          if (data.transcript) setMessages(data.transcript);
-          if (data.mode) setMode(data.mode);
-          if (data.topic) setTopic(data.topic);
-          if (data.overall && Object.keys(data.overall).length) {
-            setOverall(data.overall);
-          } else if (data.weak_points) {
-            const wp = Array.isArray(data.weak_points) ? data.weak_points : [];
-            if (wp.length) setOverall((prev) => ({ ...prev, new_weak_points: wp }));
-          }
-          const tc = data.topics_covered || data.overall?.topics_covered;
-          if (tc) setTopicsCovered(tc);
-          if (data.meta) setMeta(data.meta);
-          if (data.reference_answers) setReferenceAnswers(data.reference_answers);
-          if (data.mode === "topic_drill" || data.mode === "jd_prep") {
-            setAnswers(inferAnswers(data.questions || [], data.transcript || []));
-          }
-        })
-        .catch((err) => setReview("加载失败: " + err.message))
-        .finally(() => setLoading(false));
-    }
-  }, [sessionId, review, scores]);
+    const routeData = location.state || {};
+    const hydrated = hydrateReviewState(routeData);
+    const hasPrefetchedReview = Boolean(hydrated.review || hydrated.scores);
+
+    setReview(hydrated.review);
+    setScores(hydrated.scores);
+    setOverall(hydrated.overall);
+    setQuestions(hydrated.questions);
+    setAnswers(hydrated.answers);
+    setMessages(hydrated.messages);
+    setMode(hydrated.mode);
+    setTopic(hydrated.topic);
+    setTopicsCovered(hydrated.topicsCovered);
+    setMeta(hydrated.meta);
+    setReferenceAnswers(hydrated.referenceAnswers);
+    setShowTranscript(false);
+    setLoading(!hasPrefetchedReview);
+
+    if (hasPrefetchedReview) return undefined;
+
+    let cancelled = false;
+    getReview(sessionId)
+      .then((data) => {
+        if (cancelled) return;
+        const fetched = hydrateReviewState(data);
+        setReview(fetched.review);
+        setScores(fetched.scores);
+        setOverall(
+          data.overall && Object.keys(data.overall).length
+            ? data.overall
+            : data.weak_points
+            ? { ...(fetched.overall || {}), new_weak_points: Array.isArray(data.weak_points) ? data.weak_points : [] }
+            : fetched.overall
+        );
+        setQuestions(fetched.questions);
+        setAnswers(fetched.answers);
+        setMessages(fetched.messages);
+        setMode(fetched.mode);
+        setTopic(fetched.topic);
+        setTopicsCovered(fetched.topicsCovered);
+        setMeta(fetched.meta);
+        setReferenceAnswers(fetched.referenceAnswers);
+      })
+      .catch((err) => {
+        if (!cancelled) setReview("加载失败: " + err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, location.key]);
 
   if (loading) {
     return (

@@ -6,8 +6,20 @@ function getNavTarget(task) {
   if (task.type === "topic_drill_start" && task.result?.session_id) {
     return `/interview/${task.result.session_id}`;
   }
+  if (task.type === "job_prep_start" && task.result?.session_id) {
+    return `/interview/${task.result.session_id}`;
+  }
   if (task.type === "retrospective" && task.result?.topic) {
     return `/profile/topic/${task.result.topic}`;
+  }
+  if (task.type === "reference_answer") {
+    return null;
+  }
+  if (task.type === "job_prep_preview") {
+    return null;
+  }
+  if (task.type === "knowledge_generate") {
+    return "/knowledge";
   }
   // drill_review, jd_review, recording, resume_review → review page
   return `/review/${task.id}`;
@@ -39,7 +51,8 @@ export default function TaskNotification() {
               <button
                 className="text-[14px] text-primary font-medium hover:underline cursor-pointer"
                 onClick={() => {
-                  navigate(getNavTarget(task));
+                  const target = getNavTarget(task);
+                  if (target) navigate(target);
                   dismissTask(task.id);
                 }}
               >

@@ -60,87 +60,57 @@ _EVAL_TAG_SUFFIX = "-->"
 
 
 @router.post("/job-prep/preview")
-def job_prep_preview(req: JobPrepPreviewRequest, user_id: str = Depends(get_current_user)):
+async def job_prep_preview(
+    req: JobPrepPreviewRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
     """Analyze a JD and candidate fit before starting targeted practice."""
     jd_text = req.jd_text.strip()
     if len(jd_text) < 50:
         raise HTTPException(400, "JD 内容太短，无法分析。")
-
-    try:
-        preview = generate_job_prep_preview(
-            jd_text,
-            user_id,
-            company=req.company,
-            position=req.position,
-            use_resume=req.use_resume,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(500, str(exc))
-
-    return {"preview": preview}
+    task_id = f"job_prep_preview_{str(uuid.uuid4())[:8]}"
+    _task_status[task_id] = {"status": "pending", "type": "job_prep_preview"}
+    background_tasks.add_task(
+        _preview_job_prep_background,
+        task_id,
+        jd_text,
+        req.company,
+        req.position,
+        req.use_resume,
+        user_id,
+    )
+    return {"task_id": task_id, "status": "pending"}
 
 
 @router.post("/job-prep/start")
-def job_prep_start(req: JobPrepStartRequest, user_id: str = Depends(get_current_user)):
+async def job_prep_start(
+    req: JobPrepStartRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
     """Start a JD-targeted mock interview session."""
     jd_text = req.jd_text.strip()
     if len(jd_text) < 50:
         raise HTTPException(400, "JD 内容太短，无法生成训练。")
-
-    preview = req.preview_data if isinstance(req.preview_data, dict) else None
-    if not preview:
-        try:
-            preview = generate_job_prep_preview(
-                jd_text,
-                user_id,
-                company=req.company,
-                position=req.position,
-                use_resume=req.use_resume,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(500, str(exc))
-
-    try:
-        questions = generate_job_prep_questions(
-            jd_text,
-            preview,
-            user_id,
-            use_resume=req.use_resume,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(500, str(exc))
-
     session_id = str(uuid.uuid4())[:8]
-    meta = {
-        "company": preview.get("company") or (req.company or "").strip(),
-        "position": preview.get("position") or (req.position or "").strip() or "JD 备面",
-        "jd_excerpt": jd_text[:1500],
-        "use_resume": req.use_resume,
-        "preview": preview,
-    }
-
-    create_session(
+    task_id = f"job_prep_{session_id}"
+    _task_status[task_id] = {"status": "pending", "type": "job_prep_start"}
+    background_tasks.add_task(
+        _start_job_prep_background,
+        task_id,
         session_id,
-        InterviewMode.JD_PREP.value,
-        questions=questions,
-        meta=meta,
-        user_id=user_id,
+        jd_text,
+        req.preview_data if isinstance(req.preview_data, dict) else None,
+        req.company,
+        req.position,
+        req.use_resume,
+        user_id,
     )
-    _job_prep_sessions[session_id] = {
-        "questions": questions,
-        "preview": preview,
-        "meta": meta,
-        "user_id": user_id,
-    }
-
     return {
-        "session_id": session_id,
+        "task_id": task_id,
         "mode": InterviewMode.JD_PREP.value,
-        "questions": questions,
-        "preview": preview,
-        "company": meta["company"],
-        "position": meta["position"],
-        "meta": meta,
+        "status": "pending",
     }
 
 
@@ -499,6 +469,158 @@ def _start_drill_background(
         }
 
 
+def _start_job_prep_background(
+    task_id: str,
+    session_id: str,
+    jd_text: str,
+    preview_data: dict | None,
+    company: str | None,
+    position: str | None,
+    use_resume: bool,
+    user_id: str,
+):
+    """Background task: generate JD prep preview/questions and create the session."""
+    try:
+        preview = preview_data if isinstance(preview_data, dict) else None
+        if not preview:
+            preview = generate_job_prep_preview(
+                jd_text,
+                user_id,
+                company=company,
+                position=position,
+                use_resume=use_resume,
+            )
+
+        questions = generate_job_prep_questions(
+            jd_text,
+            preview,
+            user_id,
+            use_resume=use_resume,
+        )
+
+        meta = {
+            "company": preview.get("company") or (company or "").strip(),
+            "position": preview.get("position") or (position or "").strip() or "JD 备面",
+            "jd_excerpt": jd_text[:1500],
+            "use_resume": use_resume,
+            "preview": preview,
+        }
+
+        create_session(
+            session_id,
+            InterviewMode.JD_PREP.value,
+            questions=questions,
+            meta=meta,
+            user_id=user_id,
+        )
+        _job_prep_sessions[session_id] = {
+            "questions": questions,
+            "preview": preview,
+            "meta": meta,
+            "user_id": user_id,
+        }
+        _task_status[task_id] = {
+            "status": "done",
+            "type": "job_prep_start",
+            "result": {
+                "session_id": session_id,
+                "mode": InterviewMode.JD_PREP.value,
+                "questions": questions,
+                "preview": preview,
+                "company": meta["company"],
+                "position": meta["position"],
+                "meta": meta,
+            },
+        }
+        logger.info("JD prep session generated for %s", meta["position"])
+    except Exception as exc:
+        logger.exception("JD prep session generation failed for session %s", session_id)
+        _task_status[task_id] = {
+            "status": "error",
+            "type": "job_prep_start",
+            "error": str(exc)[:500] or "未知错误",
+        }
+
+
+def _preview_job_prep_background(
+    task_id: str,
+    jd_text: str,
+    company: str | None,
+    position: str | None,
+    use_resume: bool,
+    user_id: str,
+):
+    """Background task: generate JD prep preview."""
+    try:
+        preview = generate_job_prep_preview(
+            jd_text,
+            user_id,
+            company=company,
+            position=position,
+            use_resume=use_resume,
+        )
+        _task_status[task_id] = {
+            "status": "done",
+            "type": "job_prep_preview",
+            "result": {"preview": preview},
+        }
+    except Exception as exc:
+        logger.exception("JD prep preview generation failed")
+        _task_status[task_id] = {
+            "status": "error",
+            "type": "job_prep_preview",
+            "error": str(exc)[:500] or "未知错误",
+        }
+
+
+def _generate_reference_answer_background(
+    task_id: str,
+    session_id: str,
+    question_id: str,
+    topic: str,
+    question_text: str,
+    user_id: str,
+):
+    """Background task: generate and persist a single reference answer."""
+    try:
+        from backend.indexer import retrieve_topic_context
+        from backend.llm_provider import get_langchain_llm
+        from backend.prompts.interviewer import REFERENCE_ANSWER_PROMPT
+
+        topics = load_topics(user_id)
+        topic_name = topics.get(topic, {}).get("name", topic)
+        refs = retrieve_topic_context(topic, question_text, user_id, top_k=3)
+        knowledge_context = "\n\n".join(refs) if refs else "（暂无参考材料）"
+
+        prompt = REFERENCE_ANSWER_PROMPT.format(
+            topic_name=topic_name,
+            question=question_text,
+            knowledge_context=knowledge_context,
+        )
+
+        llm = get_langchain_llm()
+        response = llm.invoke([HumanMessage(content=prompt)])
+        answer = response.content.strip()
+        save_reference_answer(session_id, question_id, answer, user_id=user_id)
+
+        _task_status[task_id] = {
+            "status": "done",
+            "type": "reference_answer",
+            "result": {
+                "session_id": session_id,
+                "question_id": question_id,
+                "reference_answer": answer,
+            },
+        }
+    except Exception as exc:
+        logger.exception("Reference answer generation failed for session %s question %s", session_id, question_id)
+        _task_status[task_id] = {
+            "status": "error",
+            "type": "reference_answer",
+            "error": str(exc)[:500] or "未知错误",
+        }
+
+
 def _extract_answers_from_transcript(transcript: list, questions: list) -> list[dict]:
     """Reconstruct [{question_id, answer}] from the Q/A transcript pattern.
 
@@ -524,6 +646,42 @@ def _extract_answers_from_transcript(transcript: list, questions: list) -> list[
     return answers
 
 
+def _recover_batch_questions(session: dict) -> list[dict]:
+    """Return batch questions from storage, or reconstruct them from transcript.
+
+    Older sessions may have persisted transcript entries but no questions array.
+    In that case, replay the assistant turns as question text so history can
+    still reopen and review generation can still proceed.
+    """
+    questions = session.get("questions") or []
+    normalized = []
+    for idx, question in enumerate(questions, start=1):
+        if not isinstance(question, dict):
+            continue
+        question_text = (question.get("question") or "").strip()
+        if not question_text:
+            continue
+        item = dict(question)
+        item["id"] = question.get("id", idx)
+        item["question"] = question_text
+        normalized.append(item)
+    if normalized:
+        return normalized
+
+    transcript = session.get("transcript") or []
+    recovered = []
+    seen = set()
+    for entry in transcript:
+        if entry.get("role") != "assistant":
+            continue
+        question_text = (entry.get("content") or "").strip()
+        if not question_text or question_text in seen:
+            continue
+        seen.add(question_text)
+        recovered.append({"id": len(recovered) + 1, "question": question_text})
+    return recovered
+
+
 def _dispatch_review(
     session_id: str,
     session: dict,
@@ -546,7 +704,7 @@ def _dispatch_review(
     if mode == InterviewMode.TOPIC_DRILL.value:
         cached = _drill_sessions.get(session_id)
         topic = (cached or {}).get("topic") or session.get("topic")
-        questions = (cached or {}).get("questions") or session.get("questions") or []
+        questions = (cached or {}).get("questions") or _recover_batch_questions(session)
         if not topic or not questions:
             raise HTTPException(400, "会话缺少必要的题目信息，无法生成复盘。")
         answers = answers_override if answers_override is not None else _extract_answers_from_transcript(
@@ -560,7 +718,7 @@ def _dispatch_review(
 
     if mode == InterviewMode.JD_PREP.value:
         cached = _job_prep_sessions.get(session_id)
-        questions = (cached or {}).get("questions") or session.get("questions") or []
+        questions = (cached or {}).get("questions") or _recover_batch_questions(session)
         preview = (cached or {}).get("preview") or (session.get("meta") or {}).get("preview") or {}
         meta = (cached or {}).get("meta") or session.get("meta") or {}
         if not questions:
@@ -685,6 +843,9 @@ async def get_session_for_resume(
             can_continue = bool(state.next) and not is_finished
 
     meta = session.get("meta") or {}
+    questions = session.get("questions") or []
+    if session["mode"] in (InterviewMode.TOPIC_DRILL.value, InterviewMode.JD_PREP.value):
+        questions = _recover_batch_questions(session)
     return {
         "session_id": session_id,
         "mode": session["mode"],
@@ -692,7 +853,7 @@ async def get_session_for_resume(
         "status": session["status"],
         "review_error": session.get("review_error"),
         "transcript": session.get("transcript", []),
-        "questions": session.get("questions", []),
+        "questions": questions,
         "target_role": meta.get("target_role", ""),
         "meta": meta,
         "can_continue": can_continue,
@@ -768,7 +929,11 @@ async def _update_job_prep_profile(overall: dict, scores: list, total_questions:
 
 
 @router.post("/interview/reference-answer")
-async def generate_reference_answer(body: dict, user_id: str = Depends(get_current_user)):
+async def generate_reference_answer(
+    body: dict,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
     """Get a reference answer for a question in a session. Cached per (session_id, question_id)."""
     session_id = (body.get("session_id") or "").strip()
     question_id = body.get("question_id")
@@ -785,7 +950,7 @@ async def generate_reference_answer(body: dict, user_id: str = Depends(get_curre
         return {"reference_answer": cached, "cached": True}
 
     question = next(
-        (q for q in session.get("questions", []) if str(q.get("id")) == qid),
+        (q for q in _recover_batch_questions(session) if str(q.get("id")) == qid),
         None,
     )
     if not question:
@@ -795,23 +960,15 @@ async def generate_reference_answer(body: dict, user_id: str = Depends(get_curre
     if not topic or not question_text:
         raise HTTPException(400, "Session missing topic or question text.")
 
-    from backend.indexer import retrieve_topic_context
-    from backend.llm_provider import get_langchain_llm
-    from backend.prompts.interviewer import REFERENCE_ANSWER_PROMPT
-
-    topics = load_topics(user_id)
-    topic_name = topics.get(topic, {}).get("name", topic)
-    refs = retrieve_topic_context(topic, question_text, user_id, top_k=3)
-    knowledge_context = "\n\n".join(refs) if refs else "（暂无参考材料）"
-
-    prompt = REFERENCE_ANSWER_PROMPT.format(
-        topic_name=topic_name,
-        question=question_text,
-        knowledge_context=knowledge_context,
+    task_id = f"reference_answer_{session_id}_{qid}"
+    _task_status[task_id] = {"status": "pending", "type": "reference_answer"}
+    background_tasks.add_task(
+        _generate_reference_answer_background,
+        task_id,
+        session_id,
+        qid,
+        topic,
+        question_text,
+        user_id,
     )
-
-    llm = get_langchain_llm()
-    response = llm.invoke([HumanMessage(content=prompt)])
-    answer = response.content.strip()
-    save_reference_answer(session_id, qid, answer, user_id=user_id)
-    return {"reference_answer": answer, "cached": False}
+    return {"task_id": task_id, "status": "pending", "cached": False}

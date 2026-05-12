@@ -17,6 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { useTaskStatus } from "../contexts/TaskStatusContext";
 
 const PAGE_CLASS = "flex-1 w-full max-w-[1600px] mx-auto px-4 py-6 md:px-7 md:py-8 xl:px-10 2xl:px-12";
 
@@ -50,6 +51,7 @@ function toneClasses(tone) {
 
 export default function JobPrep() {
   const navigate = useNavigate();
+  const { startTask, dismissTask } = useTaskStatus();
   const [company, setCompany] = useState("");
   const [position, setPosition] = useState("");
   const [jdText, setJdText] = useState("");
@@ -98,26 +100,66 @@ export default function JobPrep() {
   const handlePreview = async () => {
     setPreviewing(true);
     setError("");
+    let waitingForTask = false;
     try {
       const data = await previewJobPrep(payload);
+      if (data.status === "pending" && data.task_id) {
+        waitingForTask = true;
+        startTask(data.task_id, "job_prep_preview", "JD 分析中", {
+          onDone: (result) => {
+            dismissTask(data.task_id);
+            setPreview(result.preview);
+            setPreviewSignature(signature);
+            setPreviewing(false);
+          },
+          onError: (message) => {
+            dismissTask(data.task_id);
+            setError("JD 分析失败: " + (message || "岗位分析失败"));
+            setPreviewing(false);
+          },
+        });
+        return;
+      }
       setPreview(data.preview);
       setPreviewSignature(signature);
     } catch (err) {
       setError("JD 分析失败: " + err.message);
     } finally {
-      setPreviewing(false);
+      if (!waitingForTask) {
+        setPreviewing(false);
+      }
     }
   };
 
   const handleStart = async () => {
     setStarting(true);
     setError("");
+    let waitingForTask = false;
     try {
       const data = await startJobPrep({ ...payload, preview_data: preview });
+      if (data.status === "pending" && data.task_id) {
+        waitingForTask = true;
+        startTask(data.task_id, "job_prep_start", "JD 备面生成中", {
+          onDone: (result) => {
+            setStarting(false);
+            dismissTask(data.task_id);
+            navigate(`/interview/${result.session_id}`, { state: result });
+          },
+          onError: (message) => {
+            setStarting(false);
+            dismissTask(data.task_id);
+            setError("启动失败: " + (message || "JD 备面生成失败"));
+          },
+        });
+        return;
+      }
       navigate(`/interview/${data.session_id}`, { state: data });
     } catch (err) {
       setError("启动失败: " + err.message);
-      setStarting(false);
+    } finally {
+      if (!waitingForTask) {
+        setStarting(false);
+      }
     }
   };
 
